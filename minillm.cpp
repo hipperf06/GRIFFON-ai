@@ -18,6 +18,9 @@ const int N_LAYER = 2;     // Transformer层数
 const int SEQ_LEN = 64;    // 最大上下文长度
 const float EPS = 1e-5f;
 const float MASK_NEG_INF = -1e9f;
+// 只采样可打印ASCII：32(空格) ~ 126(~)
+const int PRINT_MIN = 32;
+const int PRINT_MAX = 126;
 
 mt19937 rng(42);
 uniform_real_distribution<float> dist(-0.1f, 0.1f);
@@ -109,13 +112,11 @@ fmat pos_enc(int T, int d) {
     return pe;
 }
 
-// ====================== 【重点：标准因果多头注意力】 ======================
-// x: [T, D] 输入序列
+// ====================== 标准因果多头注意力 ======================
 fmat mha(const fmat &x, const fmat &wq, const fmat &wk, const fmat &wv, const fmat &wo) {
     int T = x.size();
     int hd = DIM / N_HEAD;
 
-    // 每一个位置单独算 q,k,v
     fmat q_all(T, fvec(DIM));
     fmat k_all(T, fvec(DIM));
     fmat v_all(T, fvec(DIM));
@@ -127,9 +128,7 @@ fmat mha(const fmat &x, const fmat &wq, const fmat &wk, const fmat &wv, const fm
 
     fmat out_seq(T, fvec(DIM, 0.0f));
 
-    // 逐头计算
     for(int h=0;h<N_HEAD;h++){
-        // 切出当前头 q,k,v: [T, hd]
         fmat q(T, fvec(hd));
         fmat k(T, fvec(hd));
         fmat v(T, fvec(hd));
@@ -141,7 +140,6 @@ fmat mha(const fmat &x, const fmat &wq, const fmat &wk, const fmat &wv, const fm
             }
         }
 
-        // attention score = Q @ K^T / sqrt(hd)
         fmat att_score(T, fvec(T, 0.0f));
         for(int i=0;i<T;i++){
             for(int j=0;j<T;j++){
@@ -151,19 +149,17 @@ fmat mha(const fmat &x, const fmat &wq, const fmat &wk, const fmat &wv, const fm
             }
         }
 
-        // Causal Mask！上三角设置成 -inf，不能看到未来
+        // Causal Mask
         for(int i=0;i<T;i++){
             for(int j=i+1;j<T;j++){
                 att_score[i][j] = MASK_NEG_INF;
             }
         }
 
-        // 逐行softmax
         for(int i=0;i<T;i++){
             softmax(att_score[i]);
         }
 
-        // attn @ V
         fmat head_out(T, fvec(hd, 0.0f));
         for(int i=0;i<T;i++){
             for(int j=0;j<T;j++){
@@ -174,7 +170,6 @@ fmat mha(const fmat &x, const fmat &wq, const fmat &wk, const fmat &wv, const fm
             }
         }
 
-        // 拼回输出
         for(int t=0;t<T;t++){
             for(int i=0;i<hd;i++){
                 out_seq[t][h*hd + i] = head_out[t][i];
@@ -182,7 +177,6 @@ fmat mha(const fmat &x, const fmat &wq, const fmat &wk, const fmat &wv, const fm
         }
     }
 
-    // 输出投影 wo
     fmat final_out(T, fvec(DIM));
     for(int t=0;t<T;t++){
         final_out[t] = vec_mat(out_seq[t], wo);
@@ -218,11 +212,10 @@ fmat block(fmat x,
            const fvec &ln2w, const fvec &ln2b)
 {
     int T = x.size();
-    // Pre-LN 结构（GPT标准）
+    // Pre-LN
     fmat x1 = x;
     for(int t=0;t<T;t++) layernorm(x1[t], ln1w, ln1b);
     fmat att = mha(x1, wq, wk, wv, wo);
-    // 残差连接
     for(int t=0;t<T;t++){
         for(int d=0;d<DIM;d++) x[t][d] += att[t][d];
     }
@@ -263,26 +256,29 @@ struct Model {
         lm_head = rand_mat(DIM, VOCAB_SIZE);
     }
 
-    // forward: 输入token列表，返回【最后一个位置】的logits，用来采样下一个token
     fvec forward(const vector<int> &tokens, float temp=0.8f) {
         int T = tokens.size();
         fmat x(T, fvec(DIM, 0.0f));
-        // embedding + pos
         for(int t=0;t<T;t++){
             int id = tokens[t];
             for(int d=0;d<DIM;d++){
                 x[t][d] = token_emb[id][d] + pe[t][d];
             }
         }
-        // 所有层
         for(int l=0;l<N_LAYER;l++){
             x = block(x, wq[l],wk[l],wv[l],wo[l], ln1w[l],ln1b[l],
                       w1[l],b1[l],w2[l],b2[l], ln2w[l],ln2b[l]);
         }
-        // 取最后一个token的hidden state
         fvec last = x.back();
         fvec logits = vec_mat(last, lm_head);
         for(auto &v : logits) v /= temp;
+
+        // ========= 新增：屏蔽掉不可打印字符 =========
+        for(int i=0;i<VOCAB_SIZE;i++){
+            if (i < PRINT_MIN || i > PRINT_MAX) {
+                logits[i] = MASK_NEG_INF;
+            }
+        }
         return logits;
     }
 
@@ -296,7 +292,7 @@ struct Model {
             sum += p[i];
             if(sum >= r) return i;
         }
-        return 0;
+        return PRINT_MIN;
     }
 
     string generate(string prompt, int max_new=100, float temp=0.8f) {
